@@ -31,8 +31,8 @@ Only requests with an AI-shaped body (containing `messages`, `input`, or `conten
 
 ```bash
 # From the plugin directory
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Then add to your OpenCode config (`~/.config/opencode/config.json`):
