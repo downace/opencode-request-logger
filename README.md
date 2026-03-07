@@ -35,7 +35,7 @@ bun install
 bun run build
 ```
 
-Then add to your OpenCode config (`~/.config/opencode/config.json`):
+Then add to your OpenCode config (`~/.config/opencode/opencode.jsonc`):
 
 ```json
 {
