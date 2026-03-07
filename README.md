@@ -39,10 +39,6 @@ Then add to your OpenCode config (`~/.config/opencode/config.json`):
 
 ```json
 {
-  "plugin": {
-    "opencode-request-logger": {
-      "path": "~/.config/opencode/plugin/opencode-request-logger"
-    }
-  }
+  "plugin": [ "./plugin/opencode-request-logger" ]
 }
 ```
