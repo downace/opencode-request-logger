@@ -1,109 +1,213 @@
-import type { Plugin } from "@opencode-ai/plugin";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { Plugin } from "@opencode/plugin";
+import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
-const LOG_ROOT = join(
+interface LoggerOptions {
+  enabled?: boolean;
+  directory?: string;
+}
+
+interface RequestMeta {
+  source: "http" | "fetch" | "websocket";
+  url: string;
+  kind?: string;
+  agent?: string;
+  model?: string;
+}
+
+const DEFAULT_ROOT = join(
   process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
   "opencode",
   "logs",
   "request-logger",
 );
 
-let sequence = 0;
-let currentSessionId = "unknown";
+const DEDUPE_WINDOW_MS = 30_000;
+const DEDUPE_MAX_ENTRIES = 512;
 
-/** Set of request bodies already logged by the global wrapper (avoid double-logging). */
-const logged = new WeakSet<object>();
+const state = {
+  root: DEFAULT_ROOT,
+  sequence: 0,
+  sessionID: "unknown",
+  seen: new Map<string, number>(),
+  fetchPatched: false,
+  originalFetch: undefined as typeof globalThis.fetch | undefined,
+};
 
-function getHeader(headers: any, name: string): string | null {
-  if (!headers) return null;
-  if (typeof headers.get === "function") return headers.get(name);
-  if (typeof headers === "object") return headers[name] ?? null;
-  return null;
+function sanitizeSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown";
 }
 
-function isAiRequestBody(body: any): boolean {
-  return (
-    (body.messages && Array.isArray(body.messages)) || // Anthropic, OpenAI Chat, Bedrock Converse
-    (body.input && Array.isArray(body.input)) || // OpenAI Responses API
-    (body.contents && Array.isArray(body.contents)) // Google Gemini / Vertex
-  );
+function isAiRequestBody(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const candidate = body as Record<string, unknown>;
+  if (Array.isArray(candidate.messages)) return true;
+  if (Array.isArray(candidate.input) || typeof candidate.input === "string") return true;
+  if (Array.isArray(candidate.contents) || typeof candidate.contents === "string") return true;
+  return false;
 }
 
-function resolveUrl(input: any): string {
-  if (typeof input === "string") return input;
-  if (input instanceof URL) return input.href;
-  return input?.url ?? "unknown";
+function hasAiPayload(value: unknown, depth = 0): boolean {
+  if (depth > 4 || !value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((item) => hasAiPayload(item, depth + 1));
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (key === "messages" || key === "input" || key === "contents") return true;
+    if (hasAiPayload(item, depth + 1)) return true;
+  }
+  return false;
 }
 
-function writeLog(sessionId: string, url: string, body: string): void {
-  const dir = join(LOG_ROOT, sessionId);
-  mkdirSync(dir, { recursive: true });
-
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const seq = String(sequence++).padStart(4, "0");
-  const file = join(dir, `${ts}_${seq}.json`);
-
-  const envelope = {
-    timestamp: new Date().toISOString(),
-    url,
-    body: JSON.parse(body),
-  };
-
-  writeFileSync(file, JSON.stringify(envelope, null, 2));
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalize(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
-function tryLog(init: any, input: any, source: string): void {
-  if (!init?.body || typeof init.body !== "string") return;
+function fingerprint(url: string, body: unknown): string {
+  return createHash("sha256").update(url).update("\u0000").update(canonicalize(body)).digest("hex");
+}
+
+function markSeen(key: string): boolean {
+  const now = Date.now();
+  if (state.seen.size >= DEDUPE_MAX_ENTRIES) {
+    for (const [entry, at] of state.seen) {
+      if (now - at > DEDUPE_WINDOW_MS) state.seen.delete(entry);
+    }
+  }
+  const previous = state.seen.get(key);
+  state.seen.set(key, now);
+  return previous !== undefined && now - previous <= DEDUPE_WINDOW_MS;
+}
+
+function write(sessionID: string, meta: RequestMeta, body: unknown): void {
   try {
-    const body = JSON.parse(init.body);
-    if (!isAiRequestBody(body)) return;
-    if (logged.has(body)) return;
-    logged.add(body);
-
-    const sessionId =
-      getHeader(init.headers, "x-opencode-session") || currentSessionId;
-    const url = resolveUrl(input);
-
-    writeLog(sessionId, url, init.body);
-  } catch (_e) {
+    const dir = join(state.root, sanitizeSegment(sessionID));
+    mkdirSync(dir, { recursive: true });
+    const timestamp = new Date().toISOString();
+    const seq = String(state.sequence++).padStart(4, "0");
+    const file = join(dir, `${timestamp.replace(/[:.]/g, "-")}_${seq}.json`);
+    const entry = {
+      timestamp,
+      url: meta.url,
+      source: meta.source,
+      kind: meta.kind,
+      agent: meta.agent,
+      model: meta.model,
+      body,
+    };
+    writeFileSync(file, JSON.stringify(entry, null, 2));
+  } catch {
     // Never let logging break the actual request
   }
 }
 
-const plugin: Plugin = async (_ctx) => {
-  // --- Layer 1: globalThis.fetch wrapper ---
-  // Catches most providers since AI SDK calls ultimately go through fetch.
-  const originalFetch = globalThis.fetch;
+function parseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
 
-  globalThis.fetch = async (input: any, init?: any) => {
-    tryLog(init, input, "global");
-    return originalFetch(input, init);
+async function readRequestBody(request: Request): Promise<string> {
+  try {
+    return await request.clone().text();
+  } catch {
+    return "";
+  }
+}
+
+function record(sessionID: string, meta: RequestMeta, raw: string): void {
+  const body = parseJson(raw);
+  if (body === undefined) return;
+  if (!isAiRequestBody(body)) return;
+  if (markSeen(fingerprint(meta.url, body))) return;
+  write(sessionID, meta, body);
+}
+
+function resolveUrl(input: string | URL | Request): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  if (input instanceof Request) return input.url;
+  return "unknown";
+}
+
+function installFetchWrapper(): void {
+  if (state.fetchPatched) return;
+  const original = globalThis.fetch;
+  state.originalFetch = original;
+  globalThis.fetch = async (input, init) => {
+    const body = init?.body;
+    if (typeof body === "string") {
+      record(state.sessionID, { source: "fetch", url: resolveUrl(input) }, body);
+    }
+    return original(input, init);
   };
+  state.fetchPatched = true;
+}
 
-  return {
-    // --- Layer 2: chat.params fetch wrapper ---
-    // Catches providers whose SDK may bypass globalThis.fetch
-    // (e.g. AWS Bedrock using its own HTTP client).
-    // Wraps the per-request fetch that opencode passes to streamText.
-    "chat.params": async (input, output) => {
-      if (input.sessionID) {
-        currentSessionId = input.sessionID;
-      }
+function restoreFetch(): void {
+  if (!state.fetchPatched) return;
+  if (state.originalFetch) globalThis.fetch = state.originalFetch;
+  state.originalFetch = undefined;
+  state.fetchPatched = false;
+}
 
-      const existingFetch = (output as any).options?.fetch ?? globalThis.fetch;
+export default Plugin.define({
+  id: "opencode-request-logger",
+  async setup(ctx) {
+    const options = (ctx.options ?? {}) as LoggerOptions;
+    if (options.enabled === false) return;
 
-      (output as any).options = (output as any).options ?? {};
-      (output as any).options.fetch = async (
-        fetchInput: any,
-        fetchInit?: any,
-      ) => {
-        tryLog(fetchInit, fetchInput, "chat.params");
-        return existingFetch(fetchInput, fetchInit);
-      };
-    },
-  };
-};
+    state.root = options.directory ? resolve(options.directory) : DEFAULT_ROOT;
 
-export default plugin;
+    await ctx.session.hook("http.request", async (event) => {
+      state.sessionID = event.sessionID;
+      record(
+        event.sessionID,
+        {
+          source: "http",
+          url: event.request.url,
+          kind: event.kind,
+          agent: event.agent,
+          model: `${event.model.providerID}/${event.model.id}`,
+        },
+        await readRequestBody(event.request),
+      );
+    });
+
+    await ctx.session.hook("context", (event) => {
+      state.sessionID = event.sessionID;
+    });
+
+    await ctx.session.hook("experimental.ws.send", (event) => {
+      state.sessionID = event.sessionID;
+      const frame = parseJson(event.frame);
+      if (frame === undefined || !hasAiPayload(frame)) return;
+      write(
+        event.sessionID,
+        {
+          source: "websocket",
+          url: "websocket",
+          kind: event.kind,
+          agent: event.agent,
+          model: `${event.model.providerID}/${event.model.id}`,
+        },
+        frame,
+      );
+    });
+
+    installFetchWrapper();
+
+    return () => {
+      restoreFetch();
+    };
+  },
+});
